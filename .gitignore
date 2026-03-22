@@ -1,0 +1,4 @@
+state/
+scripts/node_modules/
+scripts/package-lock.json
+.DS_Store

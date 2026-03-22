@@ -1,0 +1,7 @@
+interface:
+  display_name: "企微文档下载"
+  short_description: "下载企微知识库、腾讯文档及子链接文件，并优先复用本地登录态"
+  default_prompt: "Use $wecom-doc-downloader to download a doc.weixin.qq.com document or a linked file, and reuse the saved login state before asking me to scan again."
+
+policy:
+  allow_implicit_invocation: true

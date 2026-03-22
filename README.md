@@ -91,6 +91,7 @@ node wecom_doc_download.mjs \
 - `agents/openai.yaml`：UI 元数据
 - `scripts/wecom_doc_download.mjs`：主执行脚本
 - `examples/`：批量任务模板
+- `.github/workflows/validate.yml`：基础校验流程
 
 ## 注意
 

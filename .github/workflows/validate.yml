@@ -1,0 +1,75 @@
+name: Validate
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: python -m pip install pyyaml
+
+      - name: Install Node deps
+        run: npm install
+        working-directory: scripts
+
+      - name: Validate SKILL.md
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          import yaml
+
+          skill_md = Path("SKILL.md")
+          content = skill_md.read_text(encoding="utf-8")
+          match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+          if not match:
+              raise SystemExit("SKILL.md frontmatter is missing or invalid")
+          data = yaml.safe_load(match.group(1))
+          if not isinstance(data, dict):
+              raise SystemExit("SKILL.md frontmatter must be a YAML object")
+          for key in ("name", "description"):
+              if not data.get(key):
+                  raise SystemExit(f"SKILL.md frontmatter missing {key}")
+          print("SKILL.md is valid")
+          PY
+
+      - name: Validate script help
+        run: node wecom_doc_download.mjs --help
+        working-directory: scripts
+
+      - name: Validate example files
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path("examples/tasks.json").read_text(encoding="utf-8"))
+          assert isinstance(data, list) and data, "examples/tasks.json must be a non-empty array"
+          lines = [
+              json.loads(line)
+              for line in Path("examples/tasks.jsonl").read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+          assert lines, "examples/tasks.jsonl must contain at least one task"
+          for item in data + lines:
+              assert "url" in item and item["url"], f"task missing url: {item}"
+          print("Example task files are valid")
+          PY

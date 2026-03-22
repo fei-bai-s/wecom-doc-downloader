@@ -1,0 +1,16 @@
+[
+  {
+    "url": "https://doc.weixin.qq.com/doc/aaa",
+    "convertMd": true
+  },
+  {
+    "url": "https://doc.weixin.qq.com/doc/bbb",
+    "linkText": "情境行为性",
+    "convertMd": true
+  },
+  {
+    "url": "https://doc.weixin.qq.com/doc/ccc",
+    "format": "pdf",
+    "outputDir": "~/Downloads/wecom-pdf"
+  }
+]

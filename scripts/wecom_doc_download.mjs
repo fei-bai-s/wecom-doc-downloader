@@ -37,7 +37,15 @@ const EXPORT_NAME = {
   docx: "本地Word文档(.docx)",
   pdf: "PDF",
   png: "图片 (.png)",
+  xlsx: "本地Excel表格 (.xlsx)",
+  csv: "本地CSV文件 (.csv, 当前工作表)",
+  zip: "本地Excel表格和图片 (.zip)",
 };
+
+const SYSTEM_CHROME_CANDIDATES = [
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/Applications/Chromium.app/Contents/MacOS/Chromium",
+];
 
 function parseArgs(argv) {
   const args = {
@@ -45,6 +53,7 @@ function parseArgs(argv) {
     login: false,
     convertMd: false,
     titleOnly: false,
+    keepDuplicates: false,
     batchFile: null,
     outputDir: process.cwd(),
     timeoutMs: 30000,
@@ -65,6 +74,7 @@ function parseArgs(argv) {
     else if (token === "--login") args.login = true;
     else if (token === "--convert-md") args.convertMd = true;
     else if (token === "--title-only") args.titleOnly = true;
+    else if (token === "--keep-duplicates") args.keepDuplicates = true;
     else if (token === "--help" || token === "-h") args.help = true;
     else throw new Error(`未知参数: ${token}`);
   }
@@ -84,10 +94,12 @@ function usage() {
   --link-text "<子文件标题>"    在知识库页面点击指定链接
   --batch-file "<json/jsonl>"   批量任务清单，串行执行
   --output-dir "<目录>"         输出目录，默认当前目录
-  --format docx|pdf|png         导出格式，默认 docx
+  --format docx|pdf|png|xlsx|csv|zip
+                               导出格式；普通文档默认 docx，表格默认 xlsx
   --login                       允许弹出有界面浏览器，等待人工扫码/验证
   --convert-md                  在导出 docx 后调用 pandoc 转为 md
   --title-only                  只读取当前页面标题，不执行下载
+  --keep-duplicates             同名文件不跳过，自动追加 2/3... 后缀
   --profile-dir "<目录>"        持久化登录态目录
   --timeout-ms 30000            常规等待超时
   --manual-wait-ms 180000       人工步骤等待时间
@@ -164,6 +176,7 @@ function buildChildArgs(baseArgs, task) {
   if (task.linkText) childArgs.push("--link-text", task.linkText);
   if (task.convertMd ?? baseArgs.convertMd) childArgs.push("--convert-md");
   if (task.titleOnly ?? baseArgs.titleOnly) childArgs.push("--title-only");
+  if (task.keepDuplicates ?? baseArgs.keepDuplicates) childArgs.push("--keep-duplicates");
   if (baseArgs.login) childArgs.push("--login");
   return childArgs;
 }
@@ -291,6 +304,24 @@ async function detectDocumentTitle(page) {
   return fallback.trim();
 }
 
+function detectPageKind(url) {
+  if (!url) return "doc";
+  if (url.includes("/sheet/") || url.includes("/smartsheet/")) return "sheet";
+  return "doc";
+}
+
+function resolveFormat(args, page) {
+  if (args.format && args.format !== "docx") return args.format;
+  return page.kind === "sheet" ? "xlsx" : "docx";
+}
+
+function getExecutablePath() {
+  for (const candidate of SYSTEM_CHROME_CANDIDATES) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
 async function openTargetPage(context, page, args) {
   await page.goto(args.url, { waitUntil: "domcontentloaded", timeout: args.timeoutMs });
   await page.waitForTimeout(1200);
@@ -318,23 +349,86 @@ async function openTargetPage(context, page, args) {
   return nextPage;
 }
 
-async function exportFile(page, args) {
-  if (!EXPORT_NAME[args.format]) {
-    fail(24, `不支持的导出格式：${args.format}`);
+async function openFileMenu(page, timeoutMs) {
+  const candidates = [
+    page.locator("#headerbar-filemenu").first(),
+    page.locator("#main-menu-file").first(),
+    page.locator('[aria-label="按钮:文件操作"]').first(),
+    page.locator('[aria-label="file"]').first(),
+    page.getByRole("button", { name: "file" }).first(),
+  ];
+  for (const candidate of candidates) {
+    if (await candidate.count().catch(() => 0)) {
+      await candidate.click({ timeout: timeoutMs, force: true });
+      return;
+    }
+  }
+  fail(25, "未找到文件操作入口。", { url: page.url() });
+}
+
+async function clickMenuItem(page, locator, timeoutMs) {
+  await locator.waitFor({ timeout: timeoutMs });
+  await locator.click({ timeout: timeoutMs, force: true });
+}
+
+function nextAvailablePath(destination, keepDuplicates) {
+  if (!fs.existsSync(destination)) return destination;
+  if (!keepDuplicates) return destination;
+  const dirname = path.dirname(destination);
+  const ext = path.extname(destination);
+  const base = path.basename(destination, ext);
+  let index = 2;
+  while (true) {
+    const candidate = path.join(dirname, `${base}${index}${ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+    index += 1;
+  }
+}
+
+function findExistingOutput(outputDir, pageTitle, format) {
+  const ext = format === "docx" ? ".docx" : format === "pdf" ? ".pdf" : format === "png" ? ".png" : format === "xlsx" ? ".xlsx" : format === "csv" ? ".csv" : format === "zip" ? ".zip" : "";
+  if (!ext) return null;
+  const candidate = path.join(outputDir, `${pageTitle}${ext}`);
+  return fs.existsSync(candidate) ? candidate : null;
+}
+
+async function exportFile(page, args, runtimeFormat) {
+  if (!EXPORT_NAME[runtimeFormat]) {
+    fail(24, `不支持的导出格式：${runtimeFormat}`);
   }
   let lastError = null;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const button = page.getByRole("button", { name: "file" });
-      await button.click({ timeout: args.timeoutMs });
-      await page.getByRole("menuitem", { name: "导出为" }).click({ timeout: args.timeoutMs });
+      await openFileMenu(page, args.timeoutMs);
+      await page.waitForTimeout(400);
+      const exportSubmenu = page.locator(".mainmenu-submenu-exportAs").first();
+      if (await exportSubmenu.count().catch(() => 0)) {
+        await exportSubmenu.hover({ timeout: args.timeoutMs, force: true });
+      } else {
+        const exportMenuItem = page.getByRole("menuitem", { name: /导出|导出为/ }).first();
+        await clickMenuItem(page, exportMenuItem, args.timeoutMs);
+      }
+      await page.waitForTimeout(300);
+      const exportCandidates = [
+        page.locator(`.mainmenu-item-export-local`).first(),
+        page.locator(`.mainmenu-item-export-csv`).first(),
+        page.locator(`.mainmenu-item-export-image`).first(),
+        page.locator(`.mainmenu-item-export-archive`).first(),
+        page.getByRole("menuitem", { name: EXPORT_NAME[runtimeFormat] }).first(),
+      ];
+      let exportTarget = null;
+      if (runtimeFormat === "xlsx") exportTarget = exportCandidates[0];
+      else if (runtimeFormat === "csv") exportTarget = exportCandidates[1];
+      else if (runtimeFormat === "png") exportTarget = exportCandidates[2];
+      else if (runtimeFormat === "zip") exportTarget = exportCandidates[3];
+      else exportTarget = exportCandidates[4];
       const [download] = await Promise.all([
         page.waitForEvent("download", { timeout: args.timeoutMs }),
-        page.getByRole("menuitem", { name: EXPORT_NAME[args.format] }).click({ timeout: args.timeoutMs }),
+        clickMenuItem(page, exportTarget, args.timeoutMs),
       ]);
       fs.mkdirSync(args.outputDir, { recursive: true });
       const filename = download.suggestedFilename();
-      const destination = path.join(args.outputDir, filename);
+      const destination = nextAvailablePath(path.join(args.outputDir, filename), args.keepDuplicates);
       await download.saveAs(destination);
       return destination;
     } catch (error) {
@@ -406,29 +500,39 @@ async function main() {
   const context = await chromium.launchPersistentContext(args.profileDir, {
     headless: !args.login,
     acceptDownloads: true,
+    executablePath: getExecutablePath(),
   });
 
   try {
     const page = context.pages()[0] || (await context.newPage());
     const targetPage = await openTargetPage(context, page, args);
     const pageTitle = await detectDocumentTitle(targetPage);
+    const pageKind = detectPageKind(targetPage.url());
+    const runtimeFormat = resolveFormat(args, { kind: pageKind });
     if (args.titleOnly) {
       saveSessionMeta({
         url: args.url,
         linkText: args.linkText || null,
         pageTitle,
+        pageKind,
         profileDir: args.profileDir,
       });
-      console.log(JSON.stringify({ ok: true, pageTitle, profileDir: args.profileDir }, null, 2));
+      console.log(JSON.stringify({ ok: true, pageTitle, pageKind, profileDir: args.profileDir }, null, 2));
       return;
     }
     let outputFile = null;
-    const existingDocx = args.convertMd ? findExistingDocx(args.outputDir, pageTitle) : null;
-    if (existingDocx) {
-      outputFile = existingDocx;
+    const existingOutput = !args.keepDuplicates ? findExistingOutput(args.outputDir, pageTitle, runtimeFormat) : null;
+    if (args.convertMd && runtimeFormat === "docx") {
+      const existingDocx = findExistingDocx(args.outputDir, pageTitle);
+      if (existingDocx) outputFile = existingDocx;
+    }
+    if (!outputFile && existingOutput) {
+      outputFile = existingOutput;
     } else {
-      outputFile = await exportFile(targetPage, args);
-      assertTitleMatches(pageTitle, outputFile);
+      outputFile = await exportFile(targetPage, args, runtimeFormat);
+      if (pageKind === "doc") {
+        assertTitleMatches(pageTitle, outputFile);
+      }
     }
     let markdownFile = null;
     if (args.convertMd) {
@@ -441,6 +545,8 @@ async function main() {
       url: args.url,
       linkText: args.linkText || null,
       pageTitle,
+      pageKind,
+      runtimeFormat,
       outputFile,
       markdownFile,
       profileDir: args.profileDir,
@@ -450,6 +556,8 @@ async function main() {
         {
           ok: true,
           pageTitle,
+          pageKind,
+          runtimeFormat,
           outputFile,
           markdownFile,
           profileDir: args.profileDir,
